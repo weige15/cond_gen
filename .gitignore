@@ -1,0 +1,5 @@
+dataset/
+scoring_manual.txt
+*.zip
+*:Zone.Identifier
+scoring_program/
