@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import os
 import random
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 if __package__ in (None, ""):
@@ -10,8 +13,11 @@ if __package__ in (None, ""):
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from scripts.checkpoint import CHECKPOINT_VERSION, label_maps_to_dict, save_checkpoint
 from scripts.data import (
@@ -29,6 +35,18 @@ from scripts.model import (
     diffusion_config_to_dict,
     model_config_to_dict,
 )
+
+
+@dataclass(frozen=True)
+class DistributedContext:
+    enabled: bool
+    rank: int = 0
+    local_rank: int = 0
+    world_size: int = 1
+
+    @property
+    def is_main(self) -> bool:
+        return self.rank == 0
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -74,6 +92,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def run(args: argparse.Namespace) -> int:
+    distributed = init_distributed()
     if args.steps < 1 and not args.data_check_only:
         raise ValueError("--steps must be >= 1")
     if args.batch_size < 1:
@@ -96,7 +115,7 @@ def run(args: argparse.Namespace) -> int:
         require_all_labels=args.full_data_check,
         decode_images=args.decode_images,
     )
-    print(f"train rows: {len(rows)}")
+    log(distributed, f"train rows: {len(rows)}")
     if args.data_check_only:
         return 0
 
@@ -105,7 +124,7 @@ def run(args: argparse.Namespace) -> int:
         if not rows:
             raise ValueError("--overfit_subset selected zero rows")
 
-    device = resolve_device(args.device)
+    device = resolve_device(args.device, distributed)
     model_config = ModelConfig(
         base_channels=args.base_channels,
         channel_mults=parse_int_tuple(args.channel_mults),
@@ -119,37 +138,66 @@ def run(args: argparse.Namespace) -> int:
     diffusion_config = DiffusionConfig(timesteps=args.timesteps, schedule=args.schedule)
     model = build_model(model_config).to(device)
     diffusion = build_diffusion(diffusion_config)
+    if distributed.enabled:
+        ddp_kwargs = {"find_unused_parameters": args.condition_dropout == 0}
+        if device.type == "cuda":
+            ddp_kwargs["device_ids"] = [distributed.local_rank]
+        model = DistributedDataParallel(model, **ddp_kwargs)
+        set_seed(args.seed + distributed.rank)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    ema_state = clone_state_dict(model) if args.ema_decay > 0 else None
+    ema_state = clone_state_dict(unwrap_model(model)) if args.ema_decay > 0 else None
     amp_enabled = args.amp and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
     dataset = BrainrotDataset(rows, args.image_dir, image_size=model_config.image_size)
+    sampler = (
+        DistributedSampler(
+            dataset,
+            num_replicas=distributed.world_size,
+            rank=distributed.rank,
+            shuffle=True,
+            seed=args.seed,
+        )
+        if distributed.enabled
+        else None
+    )
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=sampler is None,
+        sampler=sampler,
         num_workers=args.num_workers,
         drop_last=False,
     )
     step = 0
     last_loss = None
     micro_step = 0
+    epoch = 0
     while step < args.steps:
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+        epoch += 1
         for batch in loader:
             images = batch["image"].to(device)
             animal_ids = batch["animal_id"].to(device)
             object_ids = batch["object_id"].to(device)
             if micro_step % args.grad_accum_steps == 0:
                 optimizer.zero_grad(set_to_none=True)
+            should_step = (micro_step + 1) % args.grad_accum_steps == 0
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
                 loss = diffusion.training_loss(model, images, animal_ids, object_ids)
-            if not torch.isfinite(loss):
+            if not is_finite_loss(loss, distributed):
                 raise RuntimeError(f"non-finite loss at step {step + 1}: {loss.item()}")
-            scaler.scale(loss / args.grad_accum_steps).backward()
+            sync_context = (
+                model.no_sync()
+                if isinstance(model, DistributedDataParallel) and not should_step
+                else contextlib.nullcontext()
+            )
+            with sync_context:
+                scaler.scale(loss / args.grad_accum_steps).backward()
             micro_step += 1
             last_loss = float(loss.detach().cpu())
-            if micro_step % args.grad_accum_steps != 0:
+            if not should_step:
                 continue
             if args.grad_clip > 0:
                 scaler.unscale_(optimizer)
@@ -157,38 +205,59 @@ def run(args: argparse.Namespace) -> int:
             scaler.step(optimizer)
             scaler.update()
             if ema_state is not None:
-                update_ema(ema_state, model, args.ema_decay)
+                update_ema(ema_state, unwrap_model(model), args.ema_decay)
             step += 1
             if step >= args.steps:
                 break
 
-    payload = {
-        "format_version": CHECKPOINT_VERSION,
-        "model_state": model.state_dict(),
-        "model_config": model_config_to_dict(model_config),
-        "diffusion_config": diffusion_config_to_dict(diffusion_config),
-        "label_maps": label_maps_to_dict(label_maps),
-        "seed": args.seed,
-        "training": {
-            "train_csv": str(args.train_csv),
-            "image_dir": str(args.image_dir),
-            "steps": args.steps,
-            "batch_size": args.batch_size,
-            "lr": args.lr,
-            "grad_accum_steps": args.grad_accum_steps,
-            "grad_clip": args.grad_clip,
-            "amp": args.amp,
-            "overfit_subset": args.overfit_subset,
-            "last_loss": last_loss,
-            "ema_decay": args.ema_decay,
-        },
-    }
-    if ema_state is not None:
-        payload["ema_state"] = {key: value.cpu() for key, value in ema_state.items()}
-    save_checkpoint(payload, args.checkpoint)
-    print(f"saved checkpoint: {args.checkpoint}")
-    print(f"last loss: {last_loss:.6f}")
+    if distributed.is_main:
+        model_for_save = unwrap_model(model)
+        payload = {
+            "format_version": CHECKPOINT_VERSION,
+            "model_state": model_for_save.state_dict(),
+            "model_config": model_config_to_dict(model_config),
+            "diffusion_config": diffusion_config_to_dict(diffusion_config),
+            "label_maps": label_maps_to_dict(label_maps),
+            "seed": args.seed,
+            "training": {
+                "train_csv": str(args.train_csv),
+                "image_dir": str(args.image_dir),
+                "steps": args.steps,
+                "batch_size": args.batch_size,
+                "global_batch_size": args.batch_size * distributed.world_size * args.grad_accum_steps,
+                "lr": args.lr,
+                "grad_accum_steps": args.grad_accum_steps,
+                "grad_clip": args.grad_clip,
+                "amp": args.amp,
+                "overfit_subset": args.overfit_subset,
+                "last_loss": last_loss,
+                "ema_decay": args.ema_decay,
+                "distributed": distributed.enabled,
+                "world_size": distributed.world_size,
+            },
+        }
+        if ema_state is not None:
+            payload["ema_state"] = {key: value.cpu() for key, value in ema_state.items()}
+        save_checkpoint(payload, args.checkpoint)
+        print(f"saved checkpoint: {args.checkpoint}")
+        print(f"last loss: {last_loss:.6f}")
+    if distributed.enabled:
+        dist.barrier()
     return 0
+
+
+def init_distributed() -> DistributedContext:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 1:
+        return DistributedContext(enabled=False)
+
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    if backend == "nccl":
+        torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend=backend)
+    return DistributedContext(enabled=True, rank=rank, local_rank=local_rank, world_size=world_size)
 
 
 def set_seed(seed: int) -> None:
@@ -199,7 +268,17 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def resolve_device(name: str) -> torch.device:
+def resolve_device(name: str, distributed: DistributedContext | None = None) -> torch.device:
+    distributed = distributed or DistributedContext(enabled=False)
+    if distributed.enabled:
+        if torch.cuda.is_available():
+            if name not in ("auto", "cuda"):
+                raise ValueError("distributed CUDA training expects --device auto or --device cuda")
+            return torch.device(f"cuda:{distributed.local_rank}")
+        if name not in ("auto", "cpu"):
+            raise ValueError("distributed CPU training expects --device auto or --device cpu")
+        return torch.device("cpu")
+
     if name == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(name)
@@ -217,6 +296,22 @@ def parse_int_tuple(value: str) -> tuple[int, ...]:
 
 def clone_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     return {key: value.detach().clone() for key, value in model.state_dict().items()}
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    return model.module if isinstance(model, DistributedDataParallel) else model
+
+
+def log(distributed: DistributedContext, message: str) -> None:
+    if distributed.is_main:
+        print(message)
+
+
+def is_finite_loss(loss: torch.Tensor, distributed: DistributedContext) -> bool:
+    finite = torch.isfinite(loss).to(dtype=torch.int, device=loss.device)
+    if distributed.enabled:
+        dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+    return bool(finite.item())
 
 
 @torch.no_grad()
