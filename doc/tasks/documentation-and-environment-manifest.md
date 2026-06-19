@@ -25,21 +25,29 @@ Training CLI; Generation CLI; Generated Output Validator; final environment choi
 
 ## Tasks
 
-- [ ] Replace minimal README with setup, training, generation, validation, checkpoint, seed/config, and scoring caveat sections.
-- [ ] Add dependency manifest after Python/PyTorch/package versions are chosen.
-- [ ] Document final command names exactly as implemented.
-- [ ] Document no extra data and no pretrained generator use, or document approved provenance if this changes.
-- [ ] Add final artifact notes: generated images/checkpoints stay out of git unless packaging is explicitly requested.
-- [ ] Add a documentation checklist verification step.
+- [x] Replace minimal README with setup, training, generation, validation, checkpoint, seed/config, and scoring caveat sections.
+- [x] Add dependency manifest after Python/PyTorch/package versions are chosen.
+- [x] Document final command names exactly as implemented.
+- [x] Document no extra data and no pretrained generator use, or document approved provenance if this changes.
+- [x] Add final artifact notes: generated images/checkpoints stay out of git unless packaging is explicitly requested.
+- [x] Add a documentation checklist verification step.
 
 ## Tests and Quality Gates
 
-- [ ] README contains setup, train, generate, validate, checkpoint, seed/config, dependency, and extra-data/pretrained-module notes.
-- [ ] Documented commands match implemented script paths and arguments.
-- [ ] Git status review shows generated artifacts are not staged unintentionally.
+- [x] README contains setup, train, generate, validate, checkpoint, seed/config, dependency, and extra-data/pretrained-module notes.
+- [x] Documented commands match implemented script paths and arguments.
+- [x] Git status review shows generated artifacts are not staged unintentionally.
 
 ## Done When
 
-- [ ] A teaching assistant can reproduce the intended workflow from README commands.
-- [ ] Dependency/environment manifest exists or unresolved environment choices are explicitly documented.
-- [ ] Documentation checks in `doc/test-plan.md` are satisfied.
+- [x] A teaching assistant can reproduce the intended workflow from README commands.
+- [x] Dependency/environment manifest exists or unresolved environment choices are explicitly documented.
+- [x] Documentation checks in `doc/test-plan.md` are satisfied.
+
+## Evidence
+
+- Replaced `README.md` with setup, data check, train, generate, validate, tests, compliance, and local-scoring caveat sections.
+- Added `requirements.txt` with observed minimal dependencies.
+- Updated `.gitignore` for scorer directory, Python caches, checkpoints, generated images, run dirs, and scores.
+- Passed documentation path check: `test -f scripts/train.py && test -f scripts/generate.py && test -f scripts/validate_generated.py && test -f requirements.txt`.
+- Passed README content check with `rg` for implemented commands and compliance notes.

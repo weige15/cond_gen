@@ -25,20 +25,33 @@ Data and Label Module; Model and Diffusion Module; chosen device/environment.
 
 ## Tasks
 
-- [ ] Implement CLI argument parsing for train CSV, image directory, checkpoint path, seed, device, and core training settings.
-- [ ] Add a data-check-only path that validates assignment inputs without training.
-- [ ] Wire dataset, model, diffusion loss, optimizer, seed handling, and training loop.
-- [ ] Save checkpoints with model weights, configs, label maps, seed, training settings, and optional EMA metadata.
-- [ ] Add tiny fixture dry run that performs one optimization step and verifies required checkpoint keys.
+- [x] Implement CLI argument parsing for train CSV, image directory, checkpoint path, seed, device, and core training settings.
+- [x] Add a data-check-only path that validates assignment inputs without training.
+- [x] Wire dataset, model, diffusion loss, optimizer, seed handling, and training loop.
+- [x] Save checkpoints with model weights, configs, label maps, seed, training settings, and optional EMA metadata.
+- [x] Add tiny fixture dry run that performs one optimization step and verifies required checkpoint keys.
 
 ## Tests and Quality Gates
 
-- [ ] Training CLI startup and missing-path checks pass.
-- [ ] Tiny dry run saves a checkpoint consumable by Generation CLI.
-- [ ] Full training is not required for module completion unless explicitly requested.
+- [x] Training CLI startup and missing-path checks pass.
+- [x] Tiny dry run saves a checkpoint consumable by Generation CLI.
+- [x] Full training is not required for module completion unless explicitly requested.
 
 ## Done When
 
-- [ ] A documented training command exists and can validate data or run a tiny training path.
-- [ ] Checkpoints satisfy the shared checkpoint contract.
-- [ ] Training-related test-plan checks are covered or explicitly blocked by environment.
+- [x] A documented training command exists and can validate data or run a tiny training path.
+- [x] Checkpoints satisfy the shared checkpoint contract.
+- [x] Training-related test-plan checks are covered or explicitly blocked by environment.
+
+## Evidence
+
+- Implemented `scripts/train.py` and shared checkpoint helpers in `scripts/checkpoint.py`.
+- Added `tests/test_train.py` for data-check-only, missing image failure, and one-step checkpoint smoke training.
+- Passed: `python -m unittest tests.test_train` (3 tests).
+- Passed: `python -m unittest discover -s tests -p 'test_*.py'` (15 tests).
+- Passed: `python scripts/train.py --train_csv dataset/train.csv --image_dir dataset/trainset --data_check_only --full_data_check`.
+
+## Architecture Revision Evidence
+
+- Added CLI controls for channel multipliers, residual depth, attention resolutions/heads, condition dropout, diffusion schedule, EMA, AMP, gradient accumulation, and gradient clipping.
+- Passed compact one-step training smoke with the revised parser and checkpoint contract.

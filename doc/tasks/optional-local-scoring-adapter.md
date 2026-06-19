@@ -25,20 +25,29 @@ Generated Output Validator; scorer reference files; scorer dependencies; user ap
 
 ## Tasks
 
-- [ ] Document the known local scorer command as known/not run until actually verified.
-- [ ] Add setup checks or README notes for required `test.json`, reference images, generated results directory, dependencies, and GPU expectations.
-- [ ] Keep the 2,000-vs-3,000 generated-image mismatch explicit.
-- [ ] Document that local scoring runs only after validator pass and explicit user approval.
-- [ ] Ensure scorer outputs such as `scores.json` remain out of source changes unless packaging/reporting is requested.
+- [x] Document the known local scorer command as known/not run until actually verified.
+- [x] Add setup checks or README notes for required `test.json`, reference images, generated results directory, dependencies, and GPU expectations.
+- [x] Keep the 2,000-vs-3,000 generated-image mismatch explicit.
+- [x] Document that local scoring runs only after validator pass and explicit user approval.
+- [x] Ensure scorer outputs such as `scores.json` remain out of source changes unless packaging/reporting is requested.
 
 ## Tests and Quality Gates
 
-- [ ] Scoring documentation does not claim evaluator verification before a real run.
-- [ ] Missing local scorer reference inputs are reported as setup-incomplete.
-- [ ] Known scorer command remains copied exactly from `doc/quality-gates.md`.
+- [x] Scoring documentation does not claim evaluator verification before a real run.
+- [x] Missing local scorer reference inputs are reported as setup-incomplete.
+- [x] Known scorer command remains copied exactly from `doc/quality-gates.md`.
 
 ## Done When
 
-- [ ] Local scoring is documented as optional and isolated from core validation.
-- [ ] Setup limitations are explicit.
-- [ ] No scorer command has been run or marked verified by this task alone.
+- [x] Local scoring is documented as optional and isolated from core validation.
+- [x] Setup limitations are explicit.
+- [x] No scorer command has been run or marked verified by this task alone.
+
+## Evidence
+
+- Added `scripts/check_scoring_setup.py` to check scorer file layout without running the scorer.
+- Added `tests/test_scoring_setup.py` for missing inputs, count-mismatch warning, and incomplete CLI status.
+- README documents the known scorer command as not run and keeps local scoring diagnostic.
+- Passed: `python -m unittest tests.test_scoring_setup` (3 tests).
+- Passed: `python -m unittest discover -s tests -p 'test_*.py'` (30 tests).
+- Real setup check reports incomplete as expected: missing `test.json`, missing reference image directory, missing `generated_images`, and `num_images=3000` vs expected 2,000 warning.

@@ -2,4 +2,12 @@ dataset/
 scoring_manual.txt
 *.zip
 *:Zone.Identifier
-
+scoring_program/
+__pycache__/
+*.py[cod]
+*.pth
+*.pt
+generated_images/
+checkpoints/
+runs/
+scores.json

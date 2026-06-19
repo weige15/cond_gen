@@ -25,21 +25,34 @@ Data and Label Module; Model and Diffusion Module; Training CLI checkpoint forma
 
 ## Tasks
 
-- [ ] Implement CLI argument parsing for checkpoint, generate CSV, output directory, seed, device, batch size, and sampling settings.
-- [ ] Load and validate checkpoint metadata before sampling.
-- [ ] Load generation rows and reject duplicate IDs or checkpoint-incompatible labels.
-- [ ] Sample images in batches and save exact `output_dir/{id}` RGB PNG filenames.
-- [ ] Define and implement stale-output behavior: require empty output directory or explicit overwrite flag.
-- [ ] Add tiny fixture generation check that writes exact filenames and passes validator fixtures.
+- [x] Implement CLI argument parsing for checkpoint, generate CSV, output directory, seed, device, batch size, and sampling settings.
+- [x] Load and validate checkpoint metadata before sampling.
+- [x] Load generation rows and reject duplicate IDs or checkpoint-incompatible labels.
+- [x] Sample images in batches and save exact `output_dir/{id}` RGB PNG filenames.
+- [x] Define and implement stale-output behavior: require empty output directory or explicit overwrite flag.
+- [x] Add tiny fixture generation check that writes exact filenames and passes validator fixtures.
 
 ## Tests and Quality Gates
 
-- [ ] Missing/incompatible checkpoint checks fail clearly.
-- [ ] Tiny generation fixture writes no missing or extra filenames.
-- [ ] Generated files pass the Generated Output Validator in fixture mode.
+- [x] Missing/incompatible checkpoint checks fail clearly.
+- [x] Tiny generation fixture writes no missing or extra filenames.
+- [x] Generated files pass the Generated Output Validator in fixture mode.
 
 ## Done When
 
-- [ ] Generation command can produce requested filenames from a valid tiny checkpoint.
-- [ ] Output naming and checkpoint compatibility are verified.
-- [ ] Full 2,000-image generation remains a later run gate, not required for task-file completion.
+- [x] Generation command can produce requested filenames from a valid tiny checkpoint.
+- [x] Output naming and checkpoint compatibility are verified.
+- [x] Full 2,000-image generation remains a later run gate, not required for task-file completion.
+
+## Evidence
+
+- Implemented `scripts/generate.py` with checkpoint loading, mapping compatibility checks, stale-output checks, batch sampling, and exact RGB PNG filename writes.
+- Added `tests/test_generate.py` covering missing checkpoint, incompatible label maps, duplicate generation IDs, stale output, and generation-to-validator fixture flow.
+- Passed: `python -m unittest tests.test_generate` (5 tests).
+- Passed: `python -m unittest discover -s tests -p 'test_*.py'` (27 tests).
+- Verified direct missing-checkpoint failure: `python scripts/generate.py --checkpoint /tmp/hw6-missing-checkpoint.pth --generate_csv dataset/generate.csv --output_dir /tmp/hw6-no-output --expected_count 2000`.
+
+## Architecture Revision Evidence
+
+- Added EMA checkpoint loading, reduced-step DDIM sampling, classifier-free guidance scale, and DDIM eta controls.
+- Passed compact checkpoint-to-generation-to-validator smoke using `--use_ema` and `--sampling_steps 2`.
