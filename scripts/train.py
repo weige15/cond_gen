@@ -5,6 +5,7 @@ import contextlib
 import os
 import random
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -62,6 +63,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--grad_accum_steps", type=int, default=1)
     parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--log_every", type=int, default=100)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--overfit_subset", type=int)
     parser.add_argument("--data_check_only", action="store_true")
@@ -99,6 +101,8 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError("--batch_size must be >= 1")
     if args.grad_accum_steps < 1:
         raise ValueError("--grad_accum_steps must be >= 1")
+    if args.log_every < 1:
+        raise ValueError("--log_every must be >= 1")
     if not 0 <= args.condition_dropout < 1:
         raise ValueError("--condition_dropout must be in [0, 1)")
 
@@ -148,6 +152,7 @@ def run(args: argparse.Namespace) -> int:
     ema_state = clone_state_dict(unwrap_model(model)) if args.ema_decay > 0 else None
     amp_enabled = args.amp and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+    global_batch_size = args.batch_size * distributed.world_size * args.grad_accum_steps
 
     dataset = BrainrotDataset(rows, args.image_dir, image_size=model_config.image_size)
     sampler = (
@@ -173,6 +178,12 @@ def run(args: argparse.Namespace) -> int:
     last_loss = None
     micro_step = 0
     epoch = 0
+    start_time = time.monotonic()
+    log(
+        distributed,
+        f"training: steps={args.steps} per_gpu_batch={args.batch_size} "
+        f"global_batch={global_batch_size} world_size={distributed.world_size}",
+    )
     while step < args.steps:
         if sampler is not None:
             sampler.set_epoch(epoch)
@@ -207,6 +218,9 @@ def run(args: argparse.Namespace) -> int:
             if ema_state is not None:
                 update_ema(ema_state, unwrap_model(model), args.ema_decay)
             step += 1
+            if step == 1 or step % args.log_every == 0 or step >= args.steps:
+                loss_value = mean_loss(loss.detach(), distributed)
+                log_progress(distributed, step, args.steps, loss_value, start_time)
             if step >= args.steps:
                 break
 
@@ -224,7 +238,7 @@ def run(args: argparse.Namespace) -> int:
                 "image_dir": str(args.image_dir),
                 "steps": args.steps,
                 "batch_size": args.batch_size,
-                "global_batch_size": args.batch_size * distributed.world_size * args.grad_accum_steps,
+                "global_batch_size": global_batch_size,
                 "lr": args.lr,
                 "grad_accum_steps": args.grad_accum_steps,
                 "grad_clip": args.grad_clip,
@@ -307,11 +321,50 @@ def log(distributed: DistributedContext, message: str) -> None:
         print(message)
 
 
+def log_progress(
+    distributed: DistributedContext,
+    step: int,
+    total_steps: int,
+    loss: float,
+    start_time: float,
+) -> None:
+    if not distributed.is_main:
+        return
+    elapsed = time.monotonic() - start_time
+    steps_per_second = step / elapsed if elapsed > 0 else 0.0
+    remaining_steps = max(total_steps - step, 0)
+    eta = remaining_steps / steps_per_second if steps_per_second > 0 else 0.0
+    percent = 100.0 * step / total_steps
+    print(
+        f"step {step}/{total_steps} ({percent:.1f}%) "
+        f"loss={loss:.6f} elapsed={format_duration(elapsed)} "
+        f"eta={format_duration(eta)} speed={steps_per_second:.3f} steps/s",
+        flush=True,
+    )
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(int(seconds), 0)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}h{minutes:02d}m{seconds:02d}s"
+    return f"{minutes:d}m{seconds:02d}s"
+
+
 def is_finite_loss(loss: torch.Tensor, distributed: DistributedContext) -> bool:
     finite = torch.isfinite(loss).to(dtype=torch.int, device=loss.device)
     if distributed.enabled:
         dist.all_reduce(finite, op=dist.ReduceOp.MIN)
     return bool(finite.item())
+
+
+def mean_loss(loss: torch.Tensor, distributed: DistributedContext) -> float:
+    value = loss.float()
+    if distributed.enabled:
+        dist.all_reduce(value, op=dist.ReduceOp.SUM)
+        value /= distributed.world_size
+    return float(value.cpu())
 
 
 @torch.no_grad()
