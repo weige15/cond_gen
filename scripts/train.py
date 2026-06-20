@@ -6,7 +6,7 @@ import os
 import random
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 if __package__ in (None, ""):
@@ -50,6 +50,13 @@ class DistributedContext:
         return self.rank == 0
 
 
+@dataclass
+class EarlyStopState:
+    best_loss: float | None = None
+    stale_checks: int = 0
+    logged_losses: list[float] = field(default_factory=list)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the HW6 conditional DDPM from scratch.")
     parser.add_argument("--train_csv", type=Path, required=True)
@@ -64,6 +71,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--grad_accum_steps", type=int, default=1)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--log_every", type=int, default=100)
+    parser.add_argument("--checkpoint_every", type=int, default=10000)
+    parser.add_argument("--early_stop_patience", type=int, default=0)
+    parser.add_argument("--early_stop_min_delta", type=float, default=1e-4)
+    parser.add_argument("--early_stop_window", type=int, default=5)
+    parser.add_argument("--early_stop_warmup_steps", type=int, default=0)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--overfit_subset", type=int)
     parser.add_argument("--data_check_only", action="store_true")
@@ -103,6 +115,16 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError("--grad_accum_steps must be >= 1")
     if args.log_every < 1:
         raise ValueError("--log_every must be >= 1")
+    if args.checkpoint_every < 0:
+        raise ValueError("--checkpoint_every must be >= 0")
+    if args.early_stop_patience < 0:
+        raise ValueError("--early_stop_patience must be >= 0")
+    if args.early_stop_min_delta < 0:
+        raise ValueError("--early_stop_min_delta must be >= 0")
+    if args.early_stop_window < 1:
+        raise ValueError("--early_stop_window must be >= 1")
+    if args.early_stop_warmup_steps < 0:
+        raise ValueError("--early_stop_warmup_steps must be >= 0")
     if not 0 <= args.condition_dropout < 1:
         raise ValueError("--condition_dropout must be in [0, 1)")
 
@@ -179,12 +201,14 @@ def run(args: argparse.Namespace) -> int:
     micro_step = 0
     epoch = 0
     start_time = time.monotonic()
+    early_stop_state = EarlyStopState()
+    stop_reason = None
     log(
         distributed,
         f"training: steps={args.steps} per_gpu_batch={args.batch_size} "
         f"global_batch={global_batch_size} world_size={distributed.world_size}",
     )
-    while step < args.steps:
+    while step < args.steps and stop_reason is None:
         if sampler is not None:
             sampler.set_epoch(epoch)
         epoch += 1
@@ -221,39 +245,45 @@ def run(args: argparse.Namespace) -> int:
             if step == 1 or step % args.log_every == 0 or step >= args.steps:
                 loss_value = mean_loss(loss.detach(), distributed)
                 log_progress(distributed, step, args.steps, loss_value, start_time)
-            if step >= args.steps:
+                stop_reason = maybe_stop_early(early_stop_state, args, step, loss_value, distributed, device)
+            if args.checkpoint_every and step % args.checkpoint_every == 0 and distributed.is_main:
+                checkpoint_path = checkpoint_path_for_step(args.checkpoint, step)
+                save_training_checkpoint(
+                    args=args,
+                    path=checkpoint_path,
+                    distributed=distributed,
+                    label_maps=label_maps,
+                    model=model,
+                    model_config=model_config,
+                    diffusion_config=diffusion_config,
+                    ema_state=ema_state,
+                    global_batch_size=global_batch_size,
+                    completed_steps=step,
+                    last_loss=last_loss,
+                    stop_reason=None,
+                )
+                print(f"saved checkpoint: {checkpoint_path}")
+            if step >= args.steps or stop_reason is not None:
                 break
 
     if distributed.is_main:
-        model_for_save = unwrap_model(model)
-        payload = {
-            "format_version": CHECKPOINT_VERSION,
-            "model_state": model_for_save.state_dict(),
-            "model_config": model_config_to_dict(model_config),
-            "diffusion_config": diffusion_config_to_dict(diffusion_config),
-            "label_maps": label_maps_to_dict(label_maps),
-            "seed": args.seed,
-            "training": {
-                "train_csv": str(args.train_csv),
-                "image_dir": str(args.image_dir),
-                "steps": args.steps,
-                "batch_size": args.batch_size,
-                "global_batch_size": global_batch_size,
-                "lr": args.lr,
-                "grad_accum_steps": args.grad_accum_steps,
-                "grad_clip": args.grad_clip,
-                "amp": args.amp,
-                "overfit_subset": args.overfit_subset,
-                "last_loss": last_loss,
-                "ema_decay": args.ema_decay,
-                "distributed": distributed.enabled,
-                "world_size": distributed.world_size,
-            },
-        }
-        if ema_state is not None:
-            payload["ema_state"] = {key: value.cpu() for key, value in ema_state.items()}
-        save_checkpoint(payload, args.checkpoint)
+        save_training_checkpoint(
+            args=args,
+            path=args.checkpoint,
+            distributed=distributed,
+            label_maps=label_maps,
+            model=model,
+            model_config=model_config,
+            diffusion_config=diffusion_config,
+            ema_state=ema_state,
+            global_batch_size=global_batch_size,
+            completed_steps=step,
+            last_loss=last_loss,
+            stop_reason=stop_reason,
+        )
         print(f"saved checkpoint: {args.checkpoint}")
+        if stop_reason is not None:
+            print(stop_reason)
         print(f"last loss: {last_loss:.6f}")
     if distributed.enabled:
         dist.barrier()
@@ -341,6 +371,96 @@ def log_progress(
         f"eta={format_duration(eta)} speed={steps_per_second:.3f} steps/s",
         flush=True,
     )
+
+
+def maybe_stop_early(
+    state: EarlyStopState,
+    args: argparse.Namespace,
+    step: int,
+    loss: float,
+    distributed: DistributedContext,
+    device: torch.device,
+) -> str | None:
+    reason = None
+    if distributed.is_main and args.early_stop_patience > 0:
+        state.logged_losses.append(loss)
+        if step >= args.early_stop_warmup_steps and len(state.logged_losses) >= args.early_stop_window:
+            window = state.logged_losses[-args.early_stop_window :]
+            window_loss = sum(window) / len(window)
+            if state.best_loss is None or window_loss < state.best_loss - args.early_stop_min_delta:
+                state.best_loss = window_loss
+                state.stale_checks = 0
+            else:
+                state.stale_checks += 1
+                if state.stale_checks >= args.early_stop_patience:
+                    reason = (
+                        f"early stopping at step {step}: loss window average {window_loss:.6f} "
+                        f"did not improve by {args.early_stop_min_delta:g} for "
+                        f"{args.early_stop_patience} logged checks"
+                    )
+    if not distributed.enabled:
+        return reason
+    should_stop = torch.tensor(1 if reason is not None else 0, device=device)
+    dist.broadcast(should_stop, src=0)
+    if should_stop.item():
+        return reason or "early stopping requested by rank 0"
+    return None
+
+
+def save_training_checkpoint(
+    *,
+    args: argparse.Namespace,
+    path: Path,
+    distributed: DistributedContext,
+    label_maps,
+    model: nn.Module,
+    model_config: ModelConfig,
+    diffusion_config: DiffusionConfig,
+    ema_state: dict[str, torch.Tensor] | None,
+    global_batch_size: int,
+    completed_steps: int,
+    last_loss: float | None,
+    stop_reason: str | None,
+) -> None:
+    model_for_save = unwrap_model(model)
+    payload = {
+        "format_version": CHECKPOINT_VERSION,
+        "model_state": model_for_save.state_dict(),
+        "model_config": model_config_to_dict(model_config),
+        "diffusion_config": diffusion_config_to_dict(diffusion_config),
+        "label_maps": label_maps_to_dict(label_maps),
+        "seed": args.seed,
+        "training": {
+            "train_csv": str(args.train_csv),
+            "image_dir": str(args.image_dir),
+            "steps": completed_steps,
+            "target_steps": args.steps,
+            "batch_size": args.batch_size,
+            "global_batch_size": global_batch_size,
+            "lr": args.lr,
+            "grad_accum_steps": args.grad_accum_steps,
+            "grad_clip": args.grad_clip,
+            "amp": args.amp,
+            "overfit_subset": args.overfit_subset,
+            "last_loss": last_loss,
+            "ema_decay": args.ema_decay,
+            "distributed": distributed.enabled,
+            "world_size": distributed.world_size,
+            "checkpoint_every": args.checkpoint_every,
+            "early_stop_patience": args.early_stop_patience,
+            "early_stop_min_delta": args.early_stop_min_delta,
+            "early_stop_window": args.early_stop_window,
+            "early_stop_warmup_steps": args.early_stop_warmup_steps,
+            "early_stop_reason": stop_reason,
+        },
+    }
+    if ema_state is not None:
+        payload["ema_state"] = {key: value.cpu() for key, value in ema_state.items()}
+    save_checkpoint(payload, path)
+
+
+def checkpoint_path_for_step(path: Path, step: int) -> Path:
+    return path.with_name(f"{path.stem}_step{step:06d}{path.suffix}")
 
 
 def format_duration(seconds: float) -> str:
