@@ -10,8 +10,8 @@ from pathlib import Path
 import torch
 
 from scripts.checkpoint import CHECKPOINT_VERSION, label_maps_to_dict, load_checkpoint, save_checkpoint
-from scripts.data import build_label_maps
-from scripts.generate import main
+from scripts.data import GenerateRow, build_label_maps
+from scripts.generate import _parse_devices, _shard_rows, main
 from scripts.model import DiffusionConfig, ModelConfig, build_model, diffusion_config_to_dict, model_config_to_dict
 from scripts.validate_generated import main as validate_main
 
@@ -117,6 +117,18 @@ class GenerationCliTests(unittest.TestCase):
                 ]
             )
             self.assertNotEqual(code, 0)
+
+    def test_multi_device_helpers_parse_and_shard_rows(self) -> None:
+        rows = [
+            GenerateRow(f"{index:06d}.png", "fish", "chair", "a fish and a chair", 8, 9)
+            for index in range(5)
+        ]
+
+        self.assertEqual(_parse_devices("0, cuda:1"), ["cuda:0", "cuda:1"])
+        self.assertEqual(
+            [[row.image_id for row in shard] for shard in _shard_rows(rows, 2)],
+            [["000000.png", "000002.png", "000004.png"], ["000001.png", "000003.png"]],
+        )
 
     def _checkpoint(self, root: Path) -> Path:
         label_maps = build_label_maps()

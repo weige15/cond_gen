@@ -9,9 +9,18 @@ if __package__ in (None, ""):
 
 from PIL import Image
 import torch
+import torch.multiprocessing as mp
+from torch.multiprocessing.spawn import ProcessExitedException, ProcessRaisedException
 
 from scripts.checkpoint import load_checkpoint
-from scripts.data import EXPECTED_GENERATE_ROWS, IMAGE_SIZE, build_label_maps, load_generate_rows, validate_generate_rows
+from scripts.data import (
+    EXPECTED_GENERATE_ROWS,
+    IMAGE_SIZE,
+    GenerateRow,
+    build_label_maps,
+    load_generate_rows,
+    validate_generate_rows,
+)
 from scripts.model import (
     build_diffusion,
     build_model,
@@ -29,6 +38,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output_dir", type=Path, default=Path("generated_images"))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--devices",
+        help="Comma-separated CUDA devices for sharded generation, e.g. auto, 0,1, or cuda:0,cuda:1.",
+    )
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--expected_count", type=int, default=EXPECTED_GENERATE_ROWS)
     parser.add_argument("--sampling_steps", type=int)
@@ -43,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         return run(args)
-    except (OSError, ValueError, RuntimeError) as exc:
+    except (OSError, ValueError, RuntimeError, ProcessExitedException, ProcessRaisedException) as exc:
         print(f"generation failed: {exc}", file=sys.stderr)
         return 1
 
@@ -51,19 +64,83 @@ def main(argv: list[str] | None = None) -> int:
 def run(args: argparse.Namespace) -> int:
     if args.batch_size < 1:
         raise ValueError("--batch_size must be >= 1")
+    devices = _parse_devices(args.devices)
+    if devices is not None:
+        return _run_multi_device(args, devices)
+
     set_seed(args.seed)
     device = resolve_device(args.device)
+    _activate_device(device)
+    payload, model_config, diffusion_config, label_maps = _load_checkpoint_parts(args, map_location=device)
+    rows = _load_rows(args, label_maps)
+    _prepare_output_dir(args.output_dir, {row.image_id for row in rows}, overwrite=args.overwrite)
+    written = _write_rows(args, rows, payload, model_config, diffusion_config, device)
 
-    payload = load_checkpoint(args.checkpoint, map_location=device)
+    print(f"generated {written} images in {args.output_dir}")
+    return 0
+
+
+def _run_multi_device(args: argparse.Namespace, devices: list[str]) -> int:
+    if args.device != "auto":
+        raise ValueError("--devices cannot be combined with --device")
+    _check_cuda_devices(devices)
+    if len(devices) == 1:
+        set_seed(args.seed)
+        device = torch.device(devices[0])
+        _activate_device(device)
+        payload, model_config, diffusion_config, label_maps = _load_checkpoint_parts(args, map_location=device)
+        rows = _load_rows(args, label_maps)
+        _prepare_output_dir(args.output_dir, {row.image_id for row in rows}, overwrite=args.overwrite)
+        written = _write_rows(args, rows, payload, model_config, diffusion_config, device)
+        print(f"generated {written} images in {args.output_dir}")
+        return 0
+
+    payload, _, _, label_maps = _load_checkpoint_parts(args, map_location="cpu")
+    rows = _load_rows(args, label_maps)
+    _prepare_output_dir(args.output_dir, {row.image_id for row in rows}, overwrite=args.overwrite)
+    del payload
+
+    shards = _shard_rows(rows, len(devices))
+    mp.spawn(_multi_device_worker, args=(args, devices, shards), nprocs=len(devices), join=True)
+    print(f"generated {len(rows)} images in {args.output_dir} using {len(devices)} devices")
+    return 0
+
+
+def _multi_device_worker(rank: int, args: argparse.Namespace, devices: list[str], shards: list[list[GenerateRow]]) -> None:
+    device = torch.device(devices[rank])
+    _activate_device(device)
+    set_seed(args.seed + rank)
+    payload, model_config, diffusion_config, _ = _load_checkpoint_parts(args, map_location=device)
+    _write_rows(args, shards[rank], payload, model_config, diffusion_config, device)
+
+
+def _load_checkpoint_parts(
+    args: argparse.Namespace,
+    *,
+    map_location: str | torch.device,
+):
+    payload = load_checkpoint(args.checkpoint, map_location=map_location)
     model_config = model_config_from_dict(payload["model_config"])
     diffusion_config = diffusion_config_from_dict(payload["diffusion_config"])
-
     label_maps = build_label_maps()
     _check_label_maps(payload["label_maps"], label_maps)
+    return payload, model_config, diffusion_config, label_maps
+
+
+def _load_rows(args: argparse.Namespace, label_maps) -> list[GenerateRow]:
     rows = load_generate_rows(args.generate_csv, label_maps)
     validate_generate_rows(rows, expected_count=args.expected_count)
-    _prepare_output_dir(args.output_dir, {row.image_id for row in rows}, overwrite=args.overwrite)
+    return rows
 
+
+def _write_rows(
+    args: argparse.Namespace,
+    rows: list[GenerateRow],
+    payload: dict[str, object],
+    model_config,
+    diffusion_config,
+    device: torch.device,
+) -> int:
     model = build_model(model_config).to(device)
     state_key = "ema_state" if args.use_ema else "model_state"
     if state_key not in payload:
@@ -92,8 +169,57 @@ def run(args: argparse.Namespace) -> int:
             Image.fromarray(array).save(target)
             written += 1
 
-    print(f"generated {written} images in {args.output_dir}")
-    return 0
+    return written
+
+
+def _parse_devices(value: str | None) -> list[str] | None:
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        raise ValueError("--devices must not be empty")
+    if value == "auto":
+        if not torch.cuda.is_available():
+            raise ValueError("--devices auto requires CUDA")
+        return [f"cuda:{idx}" for idx in range(torch.cuda.device_count())]
+
+    devices = []
+    for part in value.split(","):
+        name = part.strip()
+        if not name:
+            continue
+        if name.isdecimal():
+            name = f"cuda:{name}"
+        device = torch.device(name)
+        if device.type != "cuda" or device.index is None:
+            raise ValueError("--devices expects CUDA device ids like 0,1 or cuda:0,cuda:1")
+        devices.append(str(device))
+    if not devices:
+        raise ValueError("--devices must include at least one device")
+    if len(set(devices)) != len(devices):
+        raise ValueError("--devices contains duplicate devices")
+    return devices
+
+
+def _check_cuda_devices(devices: list[str]) -> None:
+    if not torch.cuda.is_available():
+        raise ValueError("CUDA requested but not available")
+    count = torch.cuda.device_count()
+    for name in devices:
+        device = torch.device(name)
+        if device.index is None or device.index >= count:
+            raise ValueError(f"CUDA device not available: {name}")
+
+
+def _activate_device(device: torch.device) -> None:
+    if device.type == "cuda" and device.index is not None:
+        torch.cuda.set_device(device)
+
+
+def _shard_rows(rows: list[GenerateRow], parts: int) -> list[list[GenerateRow]]:
+    if parts < 1:
+        raise ValueError("parts must be >= 1")
+    return [rows[rank::parts] for rank in range(parts)]
 
 
 def _check_label_maps(checkpoint_maps: dict[str, object], label_maps) -> None:
